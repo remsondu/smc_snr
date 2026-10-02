@@ -1,0 +1,1745 @@
+//+------------------------------------------------------------------+
+//|                                            SMC_LuxAlgo_EA.mq5    |
+//|                                                                  |
+//|  Smart Money Concepts EA  —  MT5 / MQL5 port of:                 |
+//|  "Smart Money Concepts [LuxAlgo]" Pine v5 indicator (TradingView)|
+//|                                                                  |
+//|  v1.13 — Refocused as a VISUAL + NOTIFIER build:                 |
+//|          • Removed the MTF liquidity sweep/run radar             |
+//|          • Removed the auto-trading engine and its filters       |
+//|          • Removed the SMC structure alert dispatch              |
+//|          • All SMC / S/R / trendline VISUALS are retained        |
+//|          • Added SMC_SnR_TL_Notifier.mqh — multi-timeframe       |
+//|            push notifications for new trendlines, new S/R        |
+//|            levels, and touches/crosses of fresh S/R levels       |
+//|  v1.12 — Ported "Smarter SnR" (© hanabil, MPL-2.0):              |
+//|          • Swing-HiLo S/R engine with zigzag pivot correction    |
+//|          • Pivot-based trendlines + break detection              |
+//|  v1.11 — Fixed invisible internal OBs and HH/HL labels           |
+//|  v1.10 — Added historical backfill on init                       |
+//|                                                                  |
+//|  License: CC BY-NC-SA 4.0  (Non-Commercial, Share-Alike)         |
+//|  https://creativecommons.org/licenses/by-nc-sa/4.0/              |
+//|                                                                  |
+//|  This is a DERIVATIVE WORK. Original © LuxAlgo.                  |
+//|  This port is also released under CC BY-NC-SA 4.0 — you may NOT  |
+//|  sell it (e.g. on the MQL5 Market) under the original license.   |
+//|                                                                  |
+//|  The S/R + trendline module is derived from "Smarter SnR"        |
+//|  © hanabil, licensed under Mozilla Public License 2.0            |
+//|  https://mozilla.org/MPL/2.0/  — notice preserved as required.   |
+//|  NOTE: MPL-2.0 and CC BY-NC-SA 4.0 are not straightforwardly     |
+//|  compatible. Keep this build private / non-distributed unless    |
+//|  you have sorted the licensing out.                              |
+//+------------------------------------------------------------------+
+#property copyright "© LuxAlgo + © hanabil (originals) — derivative port"
+#property link      "https://creativecommons.org/licenses/by-nc-sa/4.0/"
+#property version   "1.13"
+#property description "SMC visuals (BOS/CHoCH, OB, FVG, EQH/EQL, MTF, P/D), Smart S/R + Trendlines, MTF SnR/TL push notifications"
+
+//============================== ENUMS ===============================
+enum ENUM_SMC_MODE             { SMC_HISTORICAL, SMC_PRESENT };
+enum ENUM_SMC_STYLE            { SMC_COLORED, SMC_MONOCHROME };
+enum ENUM_SMC_FILTER           { SMC_ATR, SMC_CMR };
+enum ENUM_SMC_MITIGATION       { SMC_BY_CLOSE, SMC_BY_HIGHLOW };
+enum ENUM_SMC_STRUCT_DISPLAY   { SMC_ALL, SMC_BOS_ONLY, SMC_CHOCH_ONLY };
+enum ENUM_SMC_LINESTYLE        { SMC_SOLID, SMC_DASHED, SMC_DOTTED };
+enum ENUM_SMC_LABEL_SIZE       { SMC_TINY, SMC_SMALL, SMC_NORMAL };
+enum ENUM_TL_SOURCE            { TL_CLOSE_BODY, TL_SHADOW };
+
+//============================ CONSTANTS =============================
+#define BULLISH_LEG  1
+#define BEARISH_LEG  0
+#define BULLISH      1
+#define BEARISH     -1
+#define NEUTRAL      0
+
+#define LBL_TAG_BOS      "BOS"
+#define LBL_TAG_CHOCH    "CHoCH"
+
+#define OBJ_PREFIX       "SMC_"
+
+#define SNR_MAX_LEVELS   8
+#define ZZ_MAX_SEGMENTS  400
+#define DASH_MAX_LINES   14
+
+//============================== INPUTS ==============================
+input group "═══ GENERAL ═══"
+input ENUM_SMC_MODE   InpMode            = SMC_HISTORICAL;   // Display Mode
+input ENUM_SMC_STYLE  InpStyle           = SMC_COLORED;      // Color Style
+input bool            InpProcessOnTick   = false;            // Process on tick (false = on bar close only)
+
+input group "═══ HISTORICAL BACKFILL ═══"
+input bool InpBackfillOnInit = true;     // Scan historical bars when EA loads
+input int  InpBackfillBars   = 2000;     // How many bars back to scan
+
+input group "═══ INTERNAL STRUCTURE ═══"
+input bool                     InpShowInternals          = true;
+input ENUM_SMC_STRUCT_DISPLAY  InpShowInternalBull       = SMC_ALL;
+input color                    InpInternalBullColor      = clrSeaGreen;
+input ENUM_SMC_STRUCT_DISPLAY  InpShowInternalBear       = SMC_ALL;
+input color                    InpInternalBearColor      = clrCrimson;
+input bool                     InpInternalConfluence     = false;        // Confluence filter on internal breaks
+input ENUM_SMC_LABEL_SIZE      InpInternalLabelSize      = SMC_TINY;
+
+input group "═══ SWING STRUCTURE ═══"
+input bool                     InpShowStructure          = true;
+input ENUM_SMC_STRUCT_DISPLAY  InpShowSwingBull          = SMC_ALL;
+input color                    InpSwingBullColor         = clrSeaGreen;
+input ENUM_SMC_STRUCT_DISPLAY  InpShowSwingBear          = SMC_ALL;
+input color                    InpSwingBearColor         = clrCrimson;
+input ENUM_SMC_LABEL_SIZE      InpSwingLabelSize         = SMC_SMALL;
+input bool                     InpShowSwingPoints        = false;        // Show HH/HL/LH/LL labels
+input int                      InpSwingsLength           = 50;           // Pivot length for swings
+input bool                     InpShowHighLowSwings      = true;         // Strong/Weak high/low
+
+input group "═══ ORDER BLOCKS ═══"
+input bool             InpShowInternalOBs   = true;
+input int              InpInternalOBCount   = 5;            // Max internal OBs displayed
+input bool             InpShowSwingOBs      = false;
+input int              InpSwingOBCount      = 5;            // Max swing OBs displayed
+input ENUM_SMC_FILTER  InpOBFilter          = SMC_ATR;
+input ENUM_SMC_MITIGATION InpOBMitigation   = SMC_BY_HIGHLOW;
+input color            InpInternalBullOBColor = C'205,224,253';   // Light blue tint
+input color            InpInternalBearOBColor = C'253,219,221';   // Light red tint
+input color            InpSwingBullOBColor    = C'175,194,236';
+input color            InpSwingBearOBColor    = C'231,196,203';
+
+input group "═══ EQUAL HIGHS/LOWS ═══"
+input bool                  InpShowEQHEQL    = true;
+input int                   InpEQHEQLLength  = 3;
+input double                InpEQHEQLThresh  = 0.1;
+input ENUM_SMC_LABEL_SIZE   InpEQHEQLSize    = SMC_TINY;
+
+input group "═══ FAIR VALUE GAPS ═══"
+input bool             InpShowFVG          = false;
+input bool             InpFVGAutoThresh    = true;
+input ENUM_TIMEFRAMES  InpFVGTimeframe     = PERIOD_CURRENT;
+input color            InpFVGBullColor     = C'191,255,217';
+input color            InpFVGBearColor     = C'255,191,194';
+input int              InpFVGExtend        = 1;
+
+input group "═══ MTF LEVELS ═══"
+input bool                InpShowDaily    = false;
+input ENUM_SMC_LINESTYLE  InpDailyStyle   = SMC_SOLID;
+input color               InpDailyColor   = clrDodgerBlue;
+input bool                InpShowWeekly   = false;
+input ENUM_SMC_LINESTYLE  InpWeeklyStyle  = SMC_SOLID;
+input color               InpWeeklyColor  = clrDodgerBlue;
+input bool                InpShowMonthly  = false;
+input ENUM_SMC_LINESTYLE  InpMonthlyStyle = SMC_SOLID;
+input color               InpMonthlyColor = clrDodgerBlue;
+
+input group "═══ PREMIUM / DISCOUNT ═══"
+input bool   InpShowPDZones       = false;
+input color  InpPremiumColor      = clrCrimson;
+input color  InpEquilibriumColor  = clrDimGray;
+input color  InpDiscountColor     = clrSeaGreen;
+
+//------------------- v1.12: SMART S/R (hanabil port) -----------------
+input group "═══ SMART S/R (Swing HiLo) ═══"
+input bool                InpShowSnR         = true;         // Show S/R levels
+input int                 InpSnRPeriod       = 20;           // Swing period (pivot left/right bars)
+input int                 InpSnRLevelCount   = 3;            // How many S / R levels (1-8)
+input bool                InpSnRShowPrice    = true;         // Show price labels
+input ENUM_SMC_LINESTYLE  InpSnRLineStyle    = SMC_SOLID;
+input int                 InpSnRLineWidth    = 1;
+input bool                InpSnRExtendRight  = false;        // Extend lines as a right-ray
+input color               InpSupportColor    = clrRed;       // Support (matches original)
+input color               InpResistanceColor = clrDodgerBlue;// Resistance (matches original)
+input bool                InpShowZigZag      = false;        // Draw corrected zigzag
+input color               InpZigZagColor     = clrDimGray;
+
+input group "═══ TRENDLINES ═══"
+input bool                InpShowTrendlines  = true;
+input int                 InpTLPeriod        = 20;           // Trendline pivot period
+input ENUM_TL_SOURCE      InpTLSource        = TL_CLOSE_BODY;// Close body vs shadow
+input ENUM_SMC_LINESTYLE  InpTLStyle         = SMC_DASHED;
+input int                 InpTLWidth         = 1;
+input color               InpTLColor         = clrDimGray;
+input bool                InpTLShowPrice     = true;         // Projected trendline price label
+input bool                InpTLExtendToNow   = true;         // Newest line always reaches current bar
+input bool                InpTLBreakMarkers  = true;         // Draw break arrows
+input bool                InpTLNewestBreakOnly = true;       // Keep only the latest break arrow
+
+input group "═══ DASHBOARD ═══"
+input bool   InpShowDashboard         = true;    // On-chart S/R + TL readout
+
+//============================ STRUCTS ===============================
+struct Pivot {
+    double   currentLevel;
+    double   lastLevel;
+    bool     crossed;
+    datetime barTime;
+    int      barShift;   // shift at time of detection (for record-keeping only)
+};
+
+struct TrendBias { int bias; };
+
+struct OrderBlockRec {
+    double   obHigh;
+    double   obLow;
+    datetime obTime;
+    int      bias;
+    long     objId;       // unique id for object naming
+    bool     active;
+};
+
+struct FVGRec {
+    double   top;
+    double   bottom;
+    int      bias;
+    long     objId;
+    bool     active;
+    datetime createdAt;
+};
+
+struct TrailingEx {
+    double   top;
+    double   bottom;
+    datetime barTime;        // bar time of trailing context (most recent confirmed swing)
+    datetime lastTopTime;
+    datetime lastBottomTime;
+};
+
+struct EqDisplay { long objId; };
+
+//---- v1.12 ----
+struct SnRLevel {
+    double   price;
+    datetime time;
+};
+
+struct ZZPoint {
+    double   price;
+    datetime time;
+    int      type;          // +1 high, -1 low
+};
+
+struct TLine {
+    bool     valid;
+    datetime t1;  double p1;
+    datetime t2;  double p2;
+    double   slope;         // price units per second
+};
+
+struct AlertFlags {
+    bool internalBullishBOS;
+    bool internalBearishBOS;
+    bool internalBullishCHoCH;
+    bool internalBearishCHoCH;
+    bool swingBullishBOS;
+    bool swingBearishBOS;
+    bool swingBullishCHoCH;
+    bool swingBearishCHoCH;
+    bool internalBullishOB;
+    bool internalBearishOB;
+    bool swingBullishOB;
+    bool swingBearishOB;
+    bool equalHighs;
+    bool equalLows;
+    bool bullishFVG;
+    bool bearishFVG;
+    // v1.12
+    bool tlBreakUp;
+    bool tlBreakDown;
+    bool snrBreakUp;
+    bool snrBreakDown;
+};
+
+//============================ GLOBALS ===============================
+int           g_atrHandle      = INVALID_HANDLE;
+int           g_atr14Handle    = INVALID_HANDLE;
+
+Pivot         g_swingHigh, g_swingLow;
+Pivot         g_internalHigh, g_internalLow;
+Pivot         g_equalHigh, g_equalLow;
+
+TrendBias     g_swingTrend, g_internalTrend;
+TrailingEx    g_trailing;
+
+OrderBlockRec g_swingOBs[];
+OrderBlockRec g_internalOBs[];
+FVGRec        g_fvgs[];
+
+// Leg-tracking state
+int g_swingLeg     = 0, g_swingLegPrev     = 0;
+int g_internalLeg  = 0, g_internalLegPrev  = 0;
+int g_equalLeg     = 0, g_equalLegPrev     = 0;
+
+// Cumulative TR for CMR mode
+double g_cumTR         = 0.0;
+int    g_processedBars = 0;
+
+// New-bar tracker
+datetime g_lastBarTime = 0;
+
+// Object-name counter
+long g_objCounter = 0;
+
+// Per-bar flags (used by SMC detection; consumed internally for drawing)
+AlertFlags g_alerts;
+
+// Track last-displayed equal-high/low object (for PRESENT mode)
+long g_lastEqualHighObj = 0;
+long g_lastEqualLowObj  = 0;
+
+// Track last-displayed structure/swing-point objects (for PRESENT mode)
+long g_lastSwingHighStructObj = 0;
+long g_lastSwingLowStructObj  = 0;
+long g_lastInternalHighStructObj = 0;
+long g_lastInternalLowStructObj  = 0;
+
+// Initial-time anchor
+datetime g_initialTime = 0;
+
+// Backfill scan offset — added to every bar shift when > 0 (0 = live).
+int g_scanShift = 0;
+
+//---------------------- v1.12 SMART S/R STATE -----------------------
+SnRLevel g_res[];              // index 0 = R1 (most recent resistance)
+SnRLevel g_sup[];              // index 0 = S1 (most recent support)
+ZZPoint  g_zz[];               // corrected alternating zigzag
+int      g_zzSegments = 0;
+
+// Raw pivot bookkeeping for the zigzag correction
+int      g_lastRawType = 0;    // +1 = last raw pivot was a high, -1 = low
+datetime g_lastRawTime = 0;
+
+// Trendline pivot bookkeeping (separate period + source from S/R)
+double   g_tlPhVal  = 0.0, g_tlPhVal1  = 0.0;
+datetime g_tlPhTime = 0,   g_tlPhTime1 = 0;
+double   g_tlPlVal  = 0.0, g_tlPlVal1  = 0.0;
+datetime g_tlPlTime = 0,   g_tlPlTime1 = 0;
+
+TLine    g_upperTL, g_lowerTL;
+
+// Previous-bar trendline values (Pine's upperTl[1] / lowerTl[1])
+double   g_prevUpVal = 0.0, g_prevLoVal = 0.0;
+bool     g_hadUpPrev = false, g_hadLoPrev = false;
+
+long     g_tlBreakCounter = 0;
+
+//===================== UTILITY: NAMES & STYLE =======================
+string MakeName(string suffix) {
+    g_objCounter++;
+    return OBJ_PREFIX + suffix + "_" + IntegerToString(g_objCounter);
+}
+
+string MakeNameFixed(string suffix) {
+    return OBJ_PREFIX + suffix;
+}
+
+ENUM_LINE_STYLE LineStyle(ENUM_SMC_LINESTYLE s) {
+    switch(s) {
+        case SMC_DASHED: return STYLE_DASH;
+        case SMC_DOTTED: return STYLE_DOT;
+        default:         return STYLE_SOLID;
+    }
+}
+
+int LabelFontSize(ENUM_SMC_LABEL_SIZE s) {
+    switch(s) {
+        case SMC_NORMAL: return 10;
+        case SMC_SMALL:  return 8;
+        default:         return 7;
+    }
+}
+
+color ResolveSwingBull() { return InpStyle == SMC_MONOCHROME ? C'178,181,190' : InpSwingBullColor; }
+color ResolveSwingBear() { return InpStyle == SMC_MONOCHROME ? C'93,96,107'   : InpSwingBearColor; }
+color ResolveInternalBull() { return InpStyle == SMC_MONOCHROME ? C'178,181,190' : InpInternalBullColor; }
+color ResolveInternalBear() { return InpStyle == SMC_MONOCHROME ? C'93,96,107'   : InpInternalBearColor; }
+color ResolveFVGBull() { return InpStyle == SMC_MONOCHROME ? C'215,217,222' : InpFVGBullColor; }
+color ResolveFVGBear() { return InpStyle == SMC_MONOCHROME ? C'160,163,172' : InpFVGBearColor; }
+color ResolvePremium() { return InpStyle == SMC_MONOCHROME ? C'93,96,107'   : InpPremiumColor; }
+color ResolveDiscount(){ return InpStyle == SMC_MONOCHROME ? C'178,181,190' : InpDiscountColor; }
+color ResolveSupport() { return InpStyle == SMC_MONOCHROME ? C'178,181,190' : InpSupportColor; }
+color ResolveResist()  { return InpStyle == SMC_MONOCHROME ? C'93,96,107'   : InpResistanceColor; }
+
+//===================== UTILITY: BAR ACCESS ==========================
+// Logical offset 0 = most recent CLOSED bar (shift 1 in MQL5).
+double H(int off)         { return iHigh (_Symbol, _Period, off + 1 + g_scanShift); }
+double L(int off)         { return iLow  (_Symbol, _Period, off + 1 + g_scanShift); }
+double C_(int off)        { return iClose(_Symbol, _Period, off + 1 + g_scanShift); }
+double O_(int off)        { return iOpen (_Symbol, _Period, off + 1 + g_scanShift); }
+datetime T(int off)       { return iTime (_Symbol, _Period, off + 1 + g_scanShift); }
+
+// Convert a bar time back into a logical offset in the current scan frame.
+int OffsetOfTime(datetime t) {
+    if(t == 0) return -1;
+    int sh = iBarShift(_Symbol, _Period, t, false);
+    if(sh < 0) return -1;
+    return sh - 1 - g_scanShift;
+}
+
+double Highest(int size) {
+    int idx = iHighest(_Symbol, _Period, MODE_HIGH, size, 1 + g_scanShift);
+    if(idx < 0) return -DBL_MAX;
+    return iHigh(_Symbol, _Period, idx);
+}
+double Lowest(int size) {
+    int idx = iLowest(_Symbol, _Period, MODE_LOW, size, 1 + g_scanShift);
+    if(idx < 0) return DBL_MAX;
+    return iLow(_Symbol, _Period, idx);
+}
+
+double GetATR(int off) {
+    if(g_atrHandle == INVALID_HANDLE) return 0;
+    double buf[];
+    if(CopyBuffer(g_atrHandle, 0, off + 1 + g_scanShift, 1, buf) < 1) return 0;
+    return buf[0];
+}
+double GetATR14(int off) {
+    if(g_atr14Handle == INVALID_HANDLE) return 0;
+    double buf[];
+    if(CopyBuffer(g_atr14Handle, 0, off + 1 + g_scanShift, 1, buf) < 1) return 0;
+    return buf[0];
+}
+double GetVolatility(int off) {
+    if(InpOBFilter == SMC_ATR) return GetATR(off);
+    return g_processedBars > 0 ? g_cumTR / g_processedBars : 0;
+}
+
+double GetParsedHigh(int off) {
+    double v = GetVolatility(off);
+    double h = H(off), l = L(off);
+    return (h - l) >= 2.0 * v ? l : h;
+}
+double GetParsedLow(int off) {
+    double v = GetVolatility(off);
+    double h = H(off), l = L(off);
+    return (h - l) >= 2.0 * v ? h : l;
+}
+
+void UpdateCumTR() {
+    double tr = MathMax(H(0), C_(1)) - MathMin(L(0), C_(1));
+    g_cumTR += tr;
+    g_processedBars++;
+}
+
+bool IsNewBar() {
+    datetime t = iTime(_Symbol, _Period, 0);
+    if(t == 0) return false;
+    if(t != g_lastBarTime) {
+        g_lastBarTime = t;
+        return true;
+    }
+    return false;
+}
+
+//===================== UTILITY: OBJECT DRAWING ======================
+void DrawHline(string name, double price, color c, ENUM_LINE_STYLE st = STYLE_SOLID, int width = 1) {
+    if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+    ObjectSetDouble (0, name, OBJPROP_PRICE,  price);
+    ObjectSetInteger(0, name, OBJPROP_COLOR,  c);
+    ObjectSetInteger(0, name, OBJPROP_STYLE,  st);
+    ObjectSetInteger(0, name, OBJPROP_WIDTH,  width);
+    ObjectSetInteger(0, name, OBJPROP_BACK,   true);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
+void DrawTrend(string name, datetime t1, double p1, datetime t2, double p2,
+               color c, ENUM_LINE_STYLE st = STYLE_SOLID, int width = 1, bool ray = false) {
+    if(ObjectFind(0, name) < 0)
+        ObjectCreate(0, name, OBJ_TREND, 0, t1, p1, t2, p2);
+    ObjectMove(0, name, 0, t1, p1);
+    ObjectMove(0, name, 1, t2, p2);
+    ObjectSetInteger(0, name, OBJPROP_COLOR,         c);
+    ObjectSetInteger(0, name, OBJPROP_STYLE,         st);
+    ObjectSetInteger(0, name, OBJPROP_WIDTH,         width);
+    ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT,     ray);
+    ObjectSetInteger(0, name, OBJPROP_RAY_LEFT,      false);
+    ObjectSetInteger(0, name, OBJPROP_BACK,          false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE,    false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN,        true);
+}
+
+// NOTE (v1.11 fix): OBJ_RECTANGLE in MT5 uses OBJPROP_COLOR for both outline AND fill
+// when OBJPROP_FILL=true. OBJPROP_BGCOLOR is silently ignored on OBJ_RECTANGLE.
+void DrawRect(string name, datetime t1, double p1, datetime t2, double p2,
+              color border, color fill, bool back = true) {
+    if(ObjectFind(0, name) < 0)
+        ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, p1, t2, p2);
+    ObjectMove(0, name, 0, t1, p1);
+    ObjectMove(0, name, 1, t2, p2);
+    color drawColor = (border == CLR_NONE) ? fill : border;
+    ObjectSetInteger(0, name, OBJPROP_COLOR,      drawColor);
+    ObjectSetInteger(0, name, OBJPROP_BGCOLOR,    fill);   // kept for API symmetry
+    ObjectSetInteger(0, name, OBJPROP_FILL,       true);
+    ObjectSetInteger(0, name, OBJPROP_BACK,       back);
+    ObjectSetInteger(0, name, OBJPROP_STYLE,      STYLE_SOLID);
+    ObjectSetInteger(0, name, OBJPROP_WIDTH,      1);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+}
+
+void DrawText(string name, datetime t, double p, string txt, color c, int fontSize = 8,
+              ENUM_ANCHOR_POINT anchor = ANCHOR_CENTER) {
+    if(ObjectFind(0, name) < 0)
+        ObjectCreate(0, name, OBJ_TEXT, 0, t, p);
+    ObjectMove(0, name, 0, t, p);
+    ObjectSetString (0, name, OBJPROP_TEXT,    txt);
+    ObjectSetInteger(0, name, OBJPROP_COLOR,   c);
+    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+    ObjectSetString (0, name, OBJPROP_FONT,    "Arial");
+    ObjectSetInteger(0, name, OBJPROP_ANCHOR,  anchor);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN,  true);
+}
+
+// v1.12 — Wingdings arrow marker (used for trendline breaks).
+// NOTE: OBJ_ARROW anchors use ENUM_ARROW_ANCHOR (only ANCHOR_TOP / ANCHOR_BOTTOM),
+// which is a DIFFERENT enum from the ENUM_ANCHOR_POINT used by OBJ_TEXT / OBJ_LABEL.
+// Typing this parameter as ENUM_ANCHOR_POINT is a compile error in MQL5.
+void DrawArrow(string name, datetime t, double p, int code, color c, ENUM_ARROW_ANCHOR anchor) {
+    if(ObjectFind(0, name) < 0)
+        ObjectCreate(0, name, OBJ_ARROW, 0, t, p);
+    ObjectMove(0, name, 0, t, p);
+    ObjectSetInteger(0, name, OBJPROP_ARROWCODE,  code);
+    ObjectSetInteger(0, name, OBJPROP_COLOR,      c);
+    ObjectSetInteger(0, name, OBJPROP_WIDTH,      1);
+    ObjectSetInteger(0, name, OBJPROP_ANCHOR,     anchor);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+}
+
+void SafeDelete(string name) {
+    if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+}
+
+void DeleteByPrefix(string prefix) {
+    int total = ObjectsTotal(0, -1, -1);
+    for(int i = total - 1; i >= 0; i--) {
+        string n = ObjectName(0, i, -1, -1);
+        if(StringFind(n, prefix) == 0) ObjectDelete(0, n);
+    }
+}
+
+//===================== PIVOT INIT ===================================
+void InitPivot(Pivot &p) {
+    p.currentLevel = 0.0;
+    p.lastLevel    = 0.0;
+    p.crossed      = false;
+    p.barTime      = 0;
+    p.barShift     = 0;
+}
+
+//===================== LEG DETECTION ================================
+int LegFunc(int size, int &prevLegOut, int &currentLegInOut) {
+    double pivotHigh = H(size);
+    double pivotLow  = L(size);
+    double recentHi  = Highest(size);
+    double recentLo  = Lowest(size);
+
+    prevLegOut = currentLegInOut;
+    if(pivotHigh > recentHi)      currentLegInOut = BEARISH_LEG;
+    else if(pivotLow < recentLo)  currentLegInOut = BULLISH_LEG;
+    return currentLegInOut;
+}
+
+//===================== STRUCTURE / PIVOT CAPTURE ====================
+void DrawSwingPointLabel(datetime t, double price, string tag, color c, bool below) {
+    string name = MakeName("swp");
+    DrawText(name, t, price, tag, c, LabelFontSize(InpSwingLabelSize),
+             below ? ANCHOR_UPPER : ANCHOR_LOWER);
+}
+
+void DrawEqualHighLow(Pivot &p, double level, int size, bool isHigh) {
+    color c = isHigh ? ResolveSwingBear() : ResolveSwingBull();
+    string tag = isHigh ? "EQH" : "EQL";
+
+    if(InpMode == SMC_PRESENT) {
+        long lastObj = isHigh ? g_lastEqualHighObj : g_lastEqualLowObj;
+        SafeDelete(OBJ_PREFIX + "eqline_" + IntegerToString(lastObj));
+        SafeDelete(OBJ_PREFIX + "eqtxt_"  + IntegerToString(lastObj));
+    }
+
+    g_objCounter++;
+    long id = g_objCounter;
+    if(isHigh) g_lastEqualHighObj = id;
+    else       g_lastEqualLowObj  = id;
+
+    string lineName = OBJ_PREFIX + "eqline_" + IntegerToString(id);
+    string textName = OBJ_PREFIX + "eqtxt_"  + IntegerToString(id);
+
+    DrawTrend(lineName, p.barTime, p.currentLevel, T(size), level, c, STYLE_DOT, 1, false);
+
+    datetime midT = (datetime)((long)p.barTime / 2 + (long)T(size) / 2);
+    DrawText(textName, midT, level, tag, c, LabelFontSize(InpEQHEQLSize),
+             isHigh ? ANCHOR_LOWER : ANCHOR_UPPER);
+}
+
+void GetCurrentStructure(int size, bool equalMode, bool internalMode) {
+    int prevLeg = 0, curLeg = 0;
+    if(equalMode)         { curLeg = g_equalLeg;    prevLeg = g_equalLegPrev;   }
+    else if(internalMode) { curLeg = g_internalLeg; prevLeg = g_internalLegPrev;}
+    else                  { curLeg = g_swingLeg;    prevLeg = g_swingLegPrev;   }
+
+    LegFunc(size, prevLeg, curLeg);
+
+    if(equalMode)         { g_equalLeg    = curLeg; g_equalLegPrev    = prevLeg; }
+    else if(internalMode) { g_internalLeg = curLeg; g_internalLegPrev = prevLeg; }
+    else                  { g_swingLeg    = curLeg; g_swingLegPrev    = prevLeg; }
+
+    bool newPivot     = (curLeg != prevLeg);
+    if(!newPivot) return;
+
+    bool pivotLow     = (curLeg == BULLISH_LEG);
+    bool pivotHigh    = (curLeg == BEARISH_LEG);
+
+    double atr = GetATR(size);
+
+    if(pivotLow) {
+        if(equalMode) {
+            if(MathAbs(g_equalLow.currentLevel - L(size)) < InpEQHEQLThresh * atr && g_equalLow.currentLevel != 0.0) {
+                DrawEqualHighLow(g_equalLow, L(size), size, false);
+                g_alerts.equalLows = true;
+            }
+            g_equalLow.lastLevel    = g_equalLow.currentLevel;
+            g_equalLow.currentLevel = L(size);
+            g_equalLow.crossed      = false;
+            g_equalLow.barTime      = T(size);
+            g_equalLow.barShift     = size;
+        }
+        else if(internalMode) {
+            g_internalLow.lastLevel    = g_internalLow.currentLevel;
+            g_internalLow.currentLevel = L(size);
+            g_internalLow.crossed      = false;
+            g_internalLow.barTime      = T(size);
+            g_internalLow.barShift     = size;
+        }
+        else {
+            g_swingLow.lastLevel    = g_swingLow.currentLevel;
+            g_swingLow.currentLevel = L(size);
+            g_swingLow.crossed      = false;
+            g_swingLow.barTime      = T(size);
+            g_swingLow.barShift     = size;
+
+            g_trailing.bottom         = g_swingLow.currentLevel;
+            g_trailing.barTime        = g_swingLow.barTime;
+            g_trailing.lastBottomTime = g_swingLow.barTime;
+
+            if(InpShowSwingPoints) {
+                string tag = g_swingLow.currentLevel < g_swingLow.lastLevel ? "LL" : "HL";
+                DrawSwingPointLabel(T(size), L(size), tag, ResolveSwingBull(), true);
+            }
+        }
+    }
+    else if(pivotHigh) {
+        if(equalMode) {
+            if(MathAbs(g_equalHigh.currentLevel - H(size)) < InpEQHEQLThresh * atr && g_equalHigh.currentLevel != 0.0) {
+                DrawEqualHighLow(g_equalHigh, H(size), size, true);
+                g_alerts.equalHighs = true;
+            }
+            g_equalHigh.lastLevel    = g_equalHigh.currentLevel;
+            g_equalHigh.currentLevel = H(size);
+            g_equalHigh.crossed      = false;
+            g_equalHigh.barTime      = T(size);
+            g_equalHigh.barShift     = size;
+        }
+        else if(internalMode) {
+            g_internalHigh.lastLevel    = g_internalHigh.currentLevel;
+            g_internalHigh.currentLevel = H(size);
+            g_internalHigh.crossed      = false;
+            g_internalHigh.barTime      = T(size);
+            g_internalHigh.barShift     = size;
+        }
+        else {
+            g_swingHigh.lastLevel    = g_swingHigh.currentLevel;
+            g_swingHigh.currentLevel = H(size);
+            g_swingHigh.crossed      = false;
+            g_swingHigh.barTime      = T(size);
+            g_swingHigh.barShift     = size;
+
+            g_trailing.top         = g_swingHigh.currentLevel;
+            g_trailing.barTime     = g_swingHigh.barTime;
+            g_trailing.lastTopTime = g_swingHigh.barTime;
+
+            if(InpShowSwingPoints) {
+                string tag = g_swingHigh.currentLevel > g_swingHigh.lastLevel ? "HH" : "LH";
+                DrawSwingPointLabel(T(size), H(size), tag, ResolveSwingBear(), false);
+            }
+        }
+    }
+}
+
+//===================== STRUCTURE DRAW ===============================
+void DrawStructure(Pivot &p, string tag, color c, ENUM_LINE_STYLE st,
+                   ENUM_SMC_LABEL_SIZE sz, bool labelBelow,
+                   bool internalChannel, bool isLow) {
+    if(InpMode == SMC_PRESENT) {
+        long lastObj = 0;
+        if(internalChannel) lastObj = isLow ? g_lastInternalLowStructObj : g_lastInternalHighStructObj;
+        else                lastObj = isLow ? g_lastSwingLowStructObj    : g_lastSwingHighStructObj;
+        SafeDelete(OBJ_PREFIX + "structL_" + IntegerToString(lastObj));
+        SafeDelete(OBJ_PREFIX + "structT_" + IntegerToString(lastObj));
+    }
+
+    g_objCounter++;
+    long id = g_objCounter;
+    if(internalChannel) {
+        if(isLow) g_lastInternalLowStructObj = id;
+        else      g_lastInternalHighStructObj = id;
+    } else {
+        if(isLow) g_lastSwingLowStructObj = id;
+        else      g_lastSwingHighStructObj = id;
+    }
+
+    string lname = OBJ_PREFIX + "structL_" + IntegerToString(id);
+    string tname = OBJ_PREFIX + "structT_" + IntegerToString(id);
+
+    datetime nowT = T(0);
+    DrawTrend(lname, p.barTime, p.currentLevel, nowT, p.currentLevel, c, st, 1, false);
+
+    datetime midT = (datetime)((long)p.barTime / 2 + (long)nowT / 2);
+    DrawText(tname, midT, p.currentLevel, tag, c, LabelFontSize(sz),
+             labelBelow ? ANCHOR_UPPER : ANCHOR_LOWER);
+}
+
+//===================== ORDER BLOCKS =================================
+void PushOB(OrderBlockRec &arr[], OrderBlockRec &ob) {
+    int n = ArraySize(arr);
+    ArrayResize(arr, n + 1);
+    for(int i = n; i > 0; i--) arr[i] = arr[i - 1];
+    arr[0] = ob;
+    if(ArraySize(arr) > 100) ArrayResize(arr, 100);
+}
+
+void StoreOrderBlock(Pivot &p, bool internalChannel, int bias) {
+    if(!internalChannel && !InpShowSwingOBs) return;
+    if(internalChannel  && !InpShowInternalOBs) return;
+
+    int pivotShiftMQL = iBarShift(_Symbol, _Period, p.barTime, false);
+    if(pivotShiftMQL <= 0) return;
+    int pivotOff = pivotShiftMQL - 1 - g_scanShift;
+    if(pivotOff < 1) return;
+
+    int extremeOff = pivotOff;
+    double extremeVal = (bias == BEARISH) ? -DBL_MAX : DBL_MAX;
+
+    for(int off = pivotOff; off >= 1; off--) {
+        if(bias == BEARISH) {
+            double ph = GetParsedHigh(off);
+            if(ph > extremeVal) { extremeVal = ph; extremeOff = off; }
+        } else {
+            double pl = GetParsedLow(off);
+            if(pl < extremeVal) { extremeVal = pl; extremeOff = off; }
+        }
+    }
+
+    OrderBlockRec ob;
+    ob.obHigh = GetParsedHigh(extremeOff);
+    ob.obLow  = GetParsedLow(extremeOff);
+    ob.obTime = T(extremeOff);
+    ob.bias   = bias;
+    g_objCounter++;
+    ob.objId  = g_objCounter;
+    ob.active = true;
+
+    if(internalChannel) PushOB(g_internalOBs, ob);
+    else                PushOB(g_swingOBs,    ob);
+}
+
+void RemoveOBAt(OrderBlockRec &arr[], int idx) {
+    int n = ArraySize(arr);
+    if(idx < 0 || idx >= n) return;
+    SafeDelete(OBJ_PREFIX + "ob_" + IntegerToString(arr[idx].objId));
+    for(int i = idx; i < n - 1; i++) arr[i] = arr[i + 1];
+    ArrayResize(arr, n - 1);
+}
+
+void DeleteOrderBlocks(bool internalChannel) {
+    int n = internalChannel ? ArraySize(g_internalOBs) : ArraySize(g_swingOBs);
+
+    double bullSrc = (InpOBMitigation == SMC_BY_CLOSE) ? C_(0) : L(0);
+    double bearSrc = (InpOBMitigation == SMC_BY_CLOSE) ? C_(0) : H(0);
+
+    for(int i = n - 1; i >= 0; i--) {
+        OrderBlockRec ob;
+        if(internalChannel) ob = g_internalOBs[i];
+        else                ob = g_swingOBs[i];
+
+        bool crossed = false;
+        if(ob.bias == BEARISH && bearSrc > ob.obHigh) {
+            crossed = true;
+            if(internalChannel) g_alerts.internalBearishOB = true;
+            else                g_alerts.swingBearishOB    = true;
+        } else if(ob.bias == BULLISH && bullSrc < ob.obLow) {
+            crossed = true;
+            if(internalChannel) g_alerts.internalBullishOB = true;
+            else                g_alerts.swingBullishOB    = true;
+        }
+        if(crossed) {
+            if(internalChannel) RemoveOBAt(g_internalOBs, i);
+            else                RemoveOBAt(g_swingOBs, i);
+        }
+    }
+}
+
+void DrawOrderBlocks(bool internalChannel) {
+    int maxCount = internalChannel ? InpInternalOBCount : InpSwingOBCount;
+    if(maxCount <= 0) return;
+
+    int n;
+    if(internalChannel) n = ArraySize(g_internalOBs);
+    else                n = ArraySize(g_swingOBs);
+    int show = MathMin(maxCount, n);
+    datetime rightEdge = T(0) + PeriodSeconds(_Period) * 50;
+
+    for(int i = 0; i < show; i++) {
+        OrderBlockRec ob;
+        if(internalChannel) ob = g_internalOBs[i];
+        else                ob = g_swingOBs[i];
+
+        color fill;
+        if(InpStyle == SMC_MONOCHROME) {
+            fill = (ob.bias == BEARISH) ? C'120,123,134' : C'200,203,212';
+        } else {
+            if(internalChannel) fill = (ob.bias == BEARISH) ? InpInternalBearOBColor : InpInternalBullOBColor;
+            else                fill = (ob.bias == BEARISH) ? InpSwingBearOBColor    : InpSwingBullOBColor;
+        }
+        color border = fill;   // v1.11 fix
+
+        string name = OBJ_PREFIX + "ob_" + IntegerToString(ob.objId);
+        DrawRect(name, ob.obTime, ob.obHigh, rightEdge, ob.obLow, border, fill, true);
+    }
+}
+
+//===================== DISPLAY STRUCTURE (BOS/CHoCH) ================
+void DisplayStructure(bool internalChannel) {
+    bool bullishBar = true, bearishBar = true;
+    if(InpInternalConfluence && internalChannel) {
+        double h = H(0), l = L(0), c = C_(0), o = O_(0);
+        bullishBar = (h - MathMax(c, o)) > (MathMin(c, o) - l);
+        bearishBar = (h - MathMax(c, o)) < (MathMin(c, o) - l);
+    }
+
+    Pivot ph; TrendBias tb;
+    if(internalChannel) { ph = g_internalHigh; tb = g_internalTrend; }
+    else                { ph = g_swingHigh;    tb = g_swingTrend;    }
+
+    bool extraBull = internalChannel
+        ? (g_internalHigh.currentLevel != g_swingHigh.currentLevel && bullishBar)
+        : true;
+
+    double curC = C_(0), prevC = C_(1);
+    if(curC > ph.currentLevel && prevC <= ph.currentLevel && !ph.crossed && extraBull
+       && ph.currentLevel != 0.0) {
+
+        string tag = (tb.bias == BEARISH) ? LBL_TAG_CHOCH : LBL_TAG_BOS;
+
+        if(internalChannel) {
+            if(tag == LBL_TAG_CHOCH) g_alerts.internalBullishCHoCH = true;
+            else                     g_alerts.internalBullishBOS   = true;
+        } else {
+            if(tag == LBL_TAG_CHOCH) g_alerts.swingBullishCHoCH = true;
+            else                     g_alerts.swingBullishBOS   = true;
+        }
+
+        if(internalChannel) { g_internalHigh.crossed = true; g_internalTrend.bias = BULLISH; }
+        else                { g_swingHigh.crossed    = true; g_swingTrend.bias    = BULLISH; }
+
+        bool show;
+        ENUM_SMC_STRUCT_DISPLAY filt;
+        if(internalChannel) { show = InpShowInternals;  filt = InpShowInternalBull; }
+        else                { show = InpShowStructure;  filt = InpShowSwingBull;    }
+
+        bool passFilter = (filt == SMC_ALL)
+                        || (filt == SMC_BOS_ONLY  && tag != LBL_TAG_CHOCH)
+                        || (filt == SMC_CHOCH_ONLY && tag == LBL_TAG_CHOCH);
+
+        if(show && passFilter) {
+            color c = internalChannel ? ResolveInternalBull() : ResolveSwingBull();
+            ENUM_LINE_STYLE st = internalChannel ? STYLE_DASH : STYLE_SOLID;
+            ENUM_SMC_LABEL_SIZE sz = internalChannel ? InpInternalLabelSize : InpSwingLabelSize;
+            Pivot phCopy = ph;
+            DrawStructure(phCopy, tag, c, st, sz, false, internalChannel, false);
+        }
+
+        if((internalChannel && InpShowInternalOBs) || (!internalChannel && InpShowSwingOBs)) {
+            Pivot phCopy = ph;
+            StoreOrderBlock(phCopy, internalChannel, BULLISH);
+        }
+    }
+
+    Pivot pl;
+    if(internalChannel) { pl = g_internalLow; tb = g_internalTrend; }
+    else                { pl = g_swingLow;    tb = g_swingTrend;    }
+
+    bool extraBear = internalChannel
+        ? (g_internalLow.currentLevel != g_swingLow.currentLevel && bearishBar)
+        : true;
+
+    if(curC < pl.currentLevel && prevC >= pl.currentLevel && !pl.crossed && extraBear
+       && pl.currentLevel != 0.0) {
+
+        string tag = (tb.bias == BULLISH) ? LBL_TAG_CHOCH : LBL_TAG_BOS;
+
+        if(internalChannel) {
+            if(tag == LBL_TAG_CHOCH) g_alerts.internalBearishCHoCH = true;
+            else                     g_alerts.internalBearishBOS   = true;
+        } else {
+            if(tag == LBL_TAG_CHOCH) g_alerts.swingBearishCHoCH = true;
+            else                     g_alerts.swingBearishBOS   = true;
+        }
+
+        if(internalChannel) { g_internalLow.crossed = true; g_internalTrend.bias = BEARISH; }
+        else                { g_swingLow.crossed    = true; g_swingTrend.bias    = BEARISH; }
+
+        bool show;
+        ENUM_SMC_STRUCT_DISPLAY filt;
+        if(internalChannel) { show = InpShowInternals;  filt = InpShowInternalBear; }
+        else                { show = InpShowStructure;  filt = InpShowSwingBear;    }
+
+        bool passFilter = (filt == SMC_ALL)
+                        || (filt == SMC_BOS_ONLY  && tag != LBL_TAG_CHOCH)
+                        || (filt == SMC_CHOCH_ONLY && tag == LBL_TAG_CHOCH);
+
+        if(show && passFilter) {
+            color c = internalChannel ? ResolveInternalBear() : ResolveSwingBear();
+            ENUM_LINE_STYLE st = internalChannel ? STYLE_DASH : STYLE_SOLID;
+            ENUM_SMC_LABEL_SIZE sz = internalChannel ? InpInternalLabelSize : InpSwingLabelSize;
+            Pivot plCopy = pl;
+            DrawStructure(plCopy, tag, c, st, sz, true, internalChannel, true);
+        }
+
+        if((internalChannel && InpShowInternalOBs) || (!internalChannel && InpShowSwingOBs)) {
+            Pivot plCopy = pl;
+            StoreOrderBlock(plCopy, internalChannel, BEARISH);
+        }
+    }
+}
+
+//===================== FAIR VALUE GAPS ==============================
+void DeleteFairValueGaps() {
+    double curH = H(0), curL = L(0);
+    for(int i = ArraySize(g_fvgs) - 1; i >= 0; i--) {
+        bool kill = false;
+        if(g_fvgs[i].bias == BULLISH && curL < g_fvgs[i].bottom) kill = true;
+        if(g_fvgs[i].bias == BEARISH && curH > g_fvgs[i].top)    kill = true;
+        if(kill) {
+            SafeDelete(OBJ_PREFIX + "fvgT_" + IntegerToString(g_fvgs[i].objId));
+            SafeDelete(OBJ_PREFIX + "fvgB_" + IntegerToString(g_fvgs[i].objId));
+            for(int j = i; j < ArraySize(g_fvgs) - 1; j++) g_fvgs[j] = g_fvgs[j + 1];
+            ArrayResize(g_fvgs, ArraySize(g_fvgs) - 1);
+        }
+    }
+}
+
+void DrawFairValueGaps() {
+    ENUM_TIMEFRAMES tf = InpFVGTimeframe == PERIOD_CURRENT ? _Period : InpFVGTimeframe;
+
+    bool isChartTF = (tf == _Period);
+    if(!isChartTF && g_scanShift > 0) return;
+
+    if(tf != _Period) {
+        datetime cur = iTime(_Symbol, tf, 0);
+        static datetime lastFvgTfBar = 0;
+        if(cur == lastFvgTfBar) return;
+        lastFvgTfBar = cur;
+    }
+
+    int extra = isChartTF ? g_scanShift : 0;
+
+    double last2H  = iHigh (_Symbol, tf, 3 + extra);
+    double last2L  = iLow  (_Symbol, tf, 3 + extra);
+    double lastC   = iClose(_Symbol, tf, 2 + extra);
+    double lastO   = iOpen (_Symbol, tf, 2 + extra);
+    datetime lastT = iTime (_Symbol, tf, 2 + extra);
+    double curH    = iHigh (_Symbol, tf, 1 + extra);
+    double curL    = iLow  (_Symbol, tf, 1 + extra);
+    datetime curT  = iTime (_Symbol, tf, 1 + extra);
+
+    if(lastO == 0 || last2H == 0) return;
+
+    double barDeltaPct = (lastC - lastO) / (lastO * 100.0);
+    double threshold = 0.0;
+    if(InpFVGAutoThresh) {
+        static double cumAbsDelta = 0.0;
+        static int cumCount = 0;
+        cumAbsDelta += MathAbs(barDeltaPct);
+        cumCount++;
+        threshold = (cumCount > 0) ? (cumAbsDelta / cumCount) * 2.0 : 0.0;
+    }
+
+    bool bullFVG = (curL > last2H) && (lastC > last2H) && (barDeltaPct >  threshold);
+    bool bearFVG = (curH < last2L) && (lastC < last2L) && (-barDeltaPct > threshold);
+
+    datetime rightT = curT + (int)((curT - lastT) * (InpFVGExtend + 1));
+
+    if(bullFVG) {
+        g_alerts.bullishFVG = true;
+        FVGRec rec;
+        rec.top = curL; rec.bottom = last2H; rec.bias = BULLISH; rec.active = true;
+        rec.createdAt = curT;
+        g_objCounter++;
+        rec.objId = g_objCounter;
+        color c = ResolveFVGBull();
+        double mid = (curL + last2H) / 2.0;
+        DrawRect(OBJ_PREFIX + "fvgT_" + IntegerToString(rec.objId), lastT, curL,  rightT, mid,    c, c, true);
+        DrawRect(OBJ_PREFIX + "fvgB_" + IntegerToString(rec.objId), lastT, mid,   rightT, last2H, c, c, true);
+        int n = ArraySize(g_fvgs);
+        ArrayResize(g_fvgs, n + 1);
+        for(int i = n; i > 0; i--) g_fvgs[i] = g_fvgs[i - 1];
+        g_fvgs[0] = rec;
+    }
+    if(bearFVG) {
+        g_alerts.bearishFVG = true;
+        FVGRec rec;
+        rec.top = curH; rec.bottom = last2L; rec.bias = BEARISH; rec.active = true;
+        rec.createdAt = curT;
+        g_objCounter++;
+        rec.objId = g_objCounter;
+        color c = ResolveFVGBear();
+        double mid = (curH + last2L) / 2.0;
+        DrawRect(OBJ_PREFIX + "fvgT_" + IntegerToString(rec.objId), lastT, curH,  rightT, mid,    c, c, true);
+        DrawRect(OBJ_PREFIX + "fvgB_" + IntegerToString(rec.objId), lastT, mid,   rightT, last2L, c, c, true);
+        int n = ArraySize(g_fvgs);
+        ArrayResize(g_fvgs, n + 1);
+        for(int i = n; i > 0; i--) g_fvgs[i] = g_fvgs[i - 1];
+        g_fvgs[0] = rec;
+    }
+}
+
+//====================================================================
+//  v1.12 — SMART SUPPORT / RESISTANCE + TRENDLINES
+//  Ported from "Smarter SnR" (© hanabil, MPL-2.0)
+//
+//  Pine → MQL5 mapping notes:
+//
+//  * ta.pivothigh(P,P) / ta.pivotlow(P,P) → IsPivotHighRaw / IsPivotLowRaw,
+//    checked once per closed bar at logical offset P (so the pivot is
+//    confirmed exactly P bars after it printed, same as Pine).
+//
+//  * The original's "Fix Zigzag Pivot" block (hA / lA / f_AA / f_offset)
+//    exists to repair the case where ta.pivothigh fires twice with no
+//    pivotlow between them. Rather than replicate the valuewhen gymnastics,
+//    this port does the equivalent directly: when two raw pivots of the
+//    SAME type arrive back to back, it scans the bars strictly between
+//    them and inserts the opposite extreme as a synthetic pivot. The
+//    resulting S/R stream is identical — an always-alternating sequence.
+//
+//  * S1/S2/S3 and R1/R2/R3 are the 3 most recent entries of that stream
+//    (configurable up to 8 here). Levels are normalised to _Digits, which
+//    replaces the original's truncate()/mintick logic.
+//
+//  * Trendlines keep their own pivot period and source (close body vs
+//    shadow). slope is stored per SECOND, matching the original's use of
+//    xloc.bar_time, so the projection stays correct across weekend gaps.
+//
+//  * Everything below reads bars through H()/L()/C_()/T(), so it replays
+//    correctly under g_scanShift during historical backfill.
+//====================================================================
+
+//---------------- source selectors for the trendline module ---------
+double TLHigh(int off) { return (InpTLSource == TL_SHADOW) ? H(off) : C_(off); }
+double TLLow (int off) { return (InpTLSource == TL_SHADOW) ? L(off) : C_(off); }
+
+//---------------- raw pivot tests -----------------------------------
+bool IsPivotHighRaw(int centerOff, int period) {
+    double c = H(centerOff);
+    if(c <= 0) return false;
+    for(int i = 1; i <= period; i++) {
+        if(H(centerOff + i) >= c) return false;
+        if(H(centerOff - i) >= c) return false;
+    }
+    return true;
+}
+
+bool IsPivotLowRaw(int centerOff, int period) {
+    double c = L(centerOff);
+    if(c <= 0) return false;
+    for(int i = 1; i <= period; i++) {
+        if(L(centerOff + i) <= c) return false;
+        if(L(centerOff - i) <= c) return false;
+    }
+    return true;
+}
+
+bool IsPivotHighTL(int centerOff, int period) {
+    double c = TLHigh(centerOff);
+    if(c <= 0) return false;
+    for(int i = 1; i <= period; i++) {
+        if(TLHigh(centerOff + i) >= c) return false;
+        if(TLHigh(centerOff - i) >= c) return false;
+    }
+    return true;
+}
+
+bool IsPivotLowTL(int centerOff, int period) {
+    double c = TLLow(centerOff);
+    if(c <= 0) return false;
+    for(int i = 1; i <= period; i++) {
+        if(TLLow(centerOff + i) <= c) return false;
+        if(TLLow(centerOff - i) <= c) return false;
+    }
+    return true;
+}
+
+//---------------- level + zigzag storage ----------------------------
+void PushSnR(SnRLevel &arr[], double price, datetime t) {
+    int n = ArraySize(arr);
+    if(n < SNR_MAX_LEVELS) { ArrayResize(arr, n + 1); n++; }
+    for(int i = n - 1; i > 0; i--) arr[i] = arr[i - 1];
+    arr[0].price = NormalizeDouble(price, _Digits);
+    arr[0].time  = t;
+}
+
+void PushZigZag(double price, datetime t, int type) {
+    if(!InpShowZigZag) return;
+    if(g_zzSegments >= ZZ_MAX_SEGMENTS) return;
+
+    int n = ArraySize(g_zz);
+    ArrayResize(g_zz, n + 1);
+    g_zz[n].price = price;
+    g_zz[n].time  = t;
+    g_zz[n].type  = type;
+
+    if(n >= 1) {
+        g_zzSegments++;
+        string nm = OBJ_PREFIX + "zz_" + IntegerToString(g_zzSegments);
+        DrawTrend(nm, g_zz[n - 1].time, g_zz[n - 1].price, t, price,
+                  InpZigZagColor, STYLE_SOLID, 1, false);
+    }
+}
+
+//---------------- S/R engine ----------------------------------------
+// Scan strictly between two same-type pivots for the opposite extreme.
+// Returns the logical offset of the extreme bar, or -1 if the gap is empty.
+int FindExtremeBetween(int newerOff, int olderOff, bool wantHigh, double &outVal) {
+    if(olderOff - 1 < newerOff + 1) return -1;   // nothing strictly between
+
+    int bestOff = -1;
+    double best = wantHigh ? -DBL_MAX : DBL_MAX;
+
+    for(int off = olderOff - 1; off >= newerOff + 1; off--) {
+        double v = wantHigh ? H(off) : L(off);
+        if(v <= 0) continue;
+        if(wantHigh) { if(v > best) { best = v; bestOff = off; } }
+        else         { if(v < best) { best = v; bestOff = off; } }
+    }
+    if(bestOff < 0) return -1;
+    outVal = best;
+    return bestOff;
+}
+
+void UpdateSnRPivots() {
+    int P = MathMax(1, InpSnRPeriod);
+
+    bool isPH = IsPivotHighRaw(P, P);
+    bool isPL = IsPivotLowRaw (P, P);
+
+    // A bar can theoretically satisfy neither or (pathologically) both.
+    // Both is meaningless for an alternating zigzag, so ignore it.
+    if(isPH == isPL) return;
+
+    if(isPH) {
+        // Two highs in a row → insert the synthetic low that Pine's lA branch builds.
+        if(g_lastRawType == +1 && g_lastRawTime > 0) {
+            int prevOff = OffsetOfTime(g_lastRawTime);
+            if(prevOff > P) {
+                double lo = 0.0;
+                int loOff = FindExtremeBetween(P, prevOff, false, lo);
+                if(loOff >= 0) {
+                    PushSnR(g_sup, lo, T(loOff));
+                    PushZigZag(lo, T(loOff), -1);
+                }
+            }
+        }
+        PushSnR(g_res, H(P), T(P));
+        PushZigZag(H(P), T(P), +1);
+        g_lastRawType = +1;
+        g_lastRawTime = T(P);
+    }
+    else {
+        // Two lows in a row → insert the synthetic high (Pine's hA branch).
+        if(g_lastRawType == -1 && g_lastRawTime > 0) {
+            int prevOff = OffsetOfTime(g_lastRawTime);
+            if(prevOff > P) {
+                double hi = 0.0;
+                int hiOff = FindExtremeBetween(P, prevOff, true, hi);
+                if(hiOff >= 0) {
+                    PushSnR(g_res, hi, T(hiOff));
+                    PushZigZag(hi, T(hiOff), +1);
+                }
+            }
+        }
+        PushSnR(g_sup, L(P), T(P));
+        PushZigZag(L(P), T(P), -1);
+        g_lastRawType = -1;
+        g_lastRawTime = T(P);
+    }
+}
+
+//---------------- trendline engine ----------------------------------
+double TLValueAt(TLine &tl, datetime t) {
+    if(!tl.valid) return 0.0;
+    return tl.p2 + (double)((long)t - (long)tl.t2) * tl.slope;
+}
+
+void DrawTLBreakMarker(bool up) {
+    if(!InpTLBreakMarkers) return;
+
+    string nm;
+    if(InpTLNewestBreakOnly) {
+        nm = OBJ_PREFIX + (up ? "tlBrkUp" : "tlBrkDn");
+    } else {
+        g_tlBreakCounter++;
+        nm = OBJ_PREFIX + (up ? "tlBrkUp_" : "tlBrkDn_") + IntegerToString(g_tlBreakCounter);
+    }
+
+    if(up) DrawArrow(nm, T(0), L(0), 233, ResolveResist(),  ANCHOR_TOP);
+    else   DrawArrow(nm, T(0), H(0), 234, ResolveSupport(), ANCHOR_BOTTOM);
+}
+
+void UpdateTrendlines() {
+    int P = MathMax(1, InpTLPeriod);
+
+    // Snapshot the PREVIOUS bar's trendline values before any update this bar.
+    // This is what Pine reads as upperTl[1] / lowerTl[1].
+    double prevUpVal = g_prevUpVal;  bool hadUpPrev = g_hadUpPrev;
+    double prevLoVal = g_prevLoVal;  bool hadLoPrev = g_hadLoPrev;
+
+    //---- upper trendline: forms on a LOWER pivot high (descending highs)
+    if(IsPivotHighTL(P, P)) {
+        g_tlPhVal1  = g_tlPhVal;   g_tlPhTime1 = g_tlPhTime;
+        g_tlPhVal   = TLHigh(P);   g_tlPhTime  = T(P);
+
+        if(g_tlPhTime1 > 0 && g_tlPhVal < g_tlPhVal1) {
+            g_upperTL.valid = true;
+            g_upperTL.t1 = g_tlPhTime1;  g_upperTL.p1 = g_tlPhVal1;
+            g_upperTL.t2 = g_tlPhTime;   g_upperTL.p2 = g_tlPhVal;
+            double dt = (double)((long)g_upperTL.t2 - (long)g_upperTL.t1);
+            g_upperTL.slope = (dt != 0.0) ? (g_upperTL.p2 - g_upperTL.p1) / dt : 0.0;
+        }
+    }
+
+    //---- lower trendline: forms on a HIGHER pivot low (ascending lows)
+    if(IsPivotLowTL(P, P)) {
+        g_tlPlVal1  = g_tlPlVal;   g_tlPlTime1 = g_tlPlTime;
+        g_tlPlVal   = TLLow(P);    g_tlPlTime  = T(P);
+
+        if(g_tlPlTime1 > 0 && g_tlPlVal > g_tlPlVal1) {
+            g_lowerTL.valid = true;
+            g_lowerTL.t1 = g_tlPlTime1;  g_lowerTL.p1 = g_tlPlVal1;
+            g_lowerTL.t2 = g_tlPlTime;   g_lowerTL.p2 = g_tlPlVal;
+            double dt = (double)((long)g_lowerTL.t2 - (long)g_lowerTL.t1);
+            g_lowerTL.slope = (dt != 0.0) ? (g_lowerTL.p2 - g_lowerTL.p1) / dt : 0.0;
+        }
+    }
+
+    //---- break detection (Pine: srcH[1] < upperTl[1] and srcH > upperTl)
+    if(g_upperTL.valid && hadUpPrev) {
+        double nowVal = TLValueAt(g_upperTL, T(0));
+        if(TLHigh(1) < prevUpVal && TLHigh(0) > nowVal) {
+            g_alerts.tlBreakUp = true;
+            DrawTLBreakMarker(true);
+        }
+    }
+    if(g_lowerTL.valid && hadLoPrev) {
+        double nowVal = TLValueAt(g_lowerTL, T(0));
+        if(TLLow(1) > prevLoVal && TLLow(0) < nowVal) {
+            g_alerts.tlBreakDown = true;
+            DrawTLBreakMarker(false);
+        }
+    }
+
+    //---- carry this bar's values forward as next bar's [1]
+    g_prevUpVal = g_upperTL.valid ? TLValueAt(g_upperTL, T(0)) : 0.0;
+    g_hadUpPrev = g_upperTL.valid;
+    g_prevLoVal = g_lowerTL.valid ? TLValueAt(g_lowerTL, T(0)) : 0.0;
+    g_hadLoPrev = g_lowerTL.valid;
+}
+
+// Single per-bar state update. Safe to call during backfill.
+// (Drives the chart-timeframe S/R + trendline VISUALS. The multi-timeframe
+//  NOTIFICATIONS are produced independently by SMC_SnR_TL_Notifier.mqh.)
+void UpdateSmartSnR() {
+    if(InpShowSnR)        UpdateSnRPivots();
+    if(InpShowTrendlines) UpdateTrendlines();
+}
+
+//---------------- drawing -------------------------------------------
+void DrawSnRLevels() {
+    if(!InpShowSnR) return;
+
+    int cnt = MathMax(1, MathMin(SNR_MAX_LEVELS, InpSnRLevelCount));
+    datetime rightT = iTime(_Symbol, _Period, 0) + PeriodSeconds(_Period) * 10;
+    ENUM_LINE_STYLE st = LineStyle(InpSnRLineStyle);
+    int w = MathMax(1, InpSnRLineWidth);
+
+    for(int i = 0; i < SNR_MAX_LEVELS; i++) {
+        string rl = OBJ_PREFIX + "snrR_"  + IntegerToString(i + 1);
+        string rt = OBJ_PREFIX + "snrRT_" + IntegerToString(i + 1);
+        string sl = OBJ_PREFIX + "snrS_"  + IntegerToString(i + 1);
+        string sTx= OBJ_PREFIX + "snrST_" + IntegerToString(i + 1);
+
+        if(i < cnt && i < ArraySize(g_res)) {
+            DrawTrend(rl, g_res[i].time, g_res[i].price, rightT, g_res[i].price,
+                      ResolveResist(), st, w, InpSnRExtendRight);
+            if(InpSnRShowPrice)
+                DrawText(rt, rightT, g_res[i].price,
+                         "R" + IntegerToString(i + 1) + " -> " + DoubleToString(g_res[i].price, _Digits),
+                         ResolveResist(), 8, ANCHOR_LEFT);
+            else SafeDelete(rt);
+        } else { SafeDelete(rl); SafeDelete(rt); }
+
+        if(i < cnt && i < ArraySize(g_sup)) {
+            DrawTrend(sl, g_sup[i].time, g_sup[i].price, rightT, g_sup[i].price,
+                      ResolveSupport(), st, w, InpSnRExtendRight);
+            if(InpSnRShowPrice)
+                DrawText(sTx, rightT, g_sup[i].price,
+                         "S" + IntegerToString(i + 1) + " -> " + DoubleToString(g_sup[i].price, _Digits),
+                         ResolveSupport(), 8, ANCHOR_LEFT);
+            else SafeDelete(sTx);
+        } else { SafeDelete(sl); SafeDelete(sTx); }
+    }
+}
+
+void DrawTrendlinesOnChart() {
+    if(!InpShowTrendlines) {
+        SafeDelete(OBJ_PREFIX + "tlUp");   SafeDelete(OBJ_PREFIX + "tlUpTxt");
+        SafeDelete(OBJ_PREFIX + "tlLo");   SafeDelete(OBJ_PREFIX + "tlLoTxt");
+        return;
+    }
+
+    datetime nowT   = iTime(_Symbol, _Period, 0);
+    datetime rightT = InpTLExtendToNow ? nowT : nowT;
+    datetime labelT = nowT + PeriodSeconds(_Period) * 10;
+    ENUM_LINE_STYLE st = LineStyle(InpTLStyle);
+    int w = MathMax(1, InpTLWidth);
+
+    if(g_upperTL.valid) {
+        double proj = TLValueAt(g_upperTL, rightT);
+        DrawTrend(OBJ_PREFIX + "tlUp", g_upperTL.t1, g_upperTL.p1, rightT, proj,
+                  InpTLColor, st, w, false);
+        if(InpTLShowPrice)
+            DrawText(OBJ_PREFIX + "tlUpTxt", labelT, TLValueAt(g_upperTL, labelT),
+                     "Upper -> " + DoubleToString(TLValueAt(g_upperTL, nowT), _Digits),
+                     ResolveResist(), 8, ANCHOR_LEFT);
+        else SafeDelete(OBJ_PREFIX + "tlUpTxt");
+    }
+
+    if(g_lowerTL.valid) {
+        double proj = TLValueAt(g_lowerTL, rightT);
+        DrawTrend(OBJ_PREFIX + "tlLo", g_lowerTL.t1, g_lowerTL.p1, rightT, proj,
+                  InpTLColor, st, w, false);
+        if(InpTLShowPrice)
+            DrawText(OBJ_PREFIX + "tlLoTxt", labelT, TLValueAt(g_lowerTL, labelT),
+                     "Lower -> " + DoubleToString(TLValueAt(g_lowerTL, nowT), _Digits),
+                     ResolveSupport(), 8, ANCHOR_LEFT);
+        else SafeDelete(OBJ_PREFIX + "tlLoTxt");
+    }
+}
+
+//---------------- dashboard -----------------------------------------
+void DashLine(int idx, string txt, color c) {
+    string nm = OBJ_PREFIX + "dash_" + IntegerToString(idx);
+    if(ObjectFind(0, nm) < 0) ObjectCreate(0, nm, OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, nm, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, nm, OBJPROP_XDISTANCE,  10);
+    ObjectSetInteger(0, nm, OBJPROP_YDISTANCE,  18 + idx * 14);
+    ObjectSetString (0, nm, OBJPROP_TEXT,       txt);
+    ObjectSetString (0, nm, OBJPROP_FONT,       "Consolas");
+    ObjectSetInteger(0, nm, OBJPROP_FONTSIZE,   8);
+    ObjectSetInteger(0, nm, OBJPROP_COLOR,      c);
+    ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, nm, OBJPROP_HIDDEN,     true);
+}
+
+void DrawSnRDashboard() {
+    if(!InpShowDashboard) {
+        for(int i = 0; i < DASH_MAX_LINES; i++) SafeDelete(OBJ_PREFIX + "dash_" + IntegerToString(i));
+        return;
+    }
+
+    int row = 0;
+    color hdr = clrSilver;
+
+    string biasTxt = (g_swingTrend.bias == BULLISH) ? "BULL"
+                   : (g_swingTrend.bias == BEARISH) ? "BEAR" : "FLAT";
+    DashLine(row++, "SMC  " + _Symbol + "  " + EnumToString((ENUM_TIMEFRAMES)_Period)
+                    + "   swing bias: " + biasTxt, hdr);
+
+    if(InpShowSnR) {
+        int cnt = MathMax(1, MathMin(SNR_MAX_LEVELS, InpSnRLevelCount));
+        for(int i = 0; i < cnt && row < DASH_MAX_LINES - 3; i++) {
+            string s = (i < ArraySize(g_sup)) ? DoubleToString(g_sup[i].price, _Digits) : "-";
+            string r = (i < ArraySize(g_res)) ? DoubleToString(g_res[i].price, _Digits) : "-";
+            DashLine(row++, "S" + IntegerToString(i + 1) + " " + s
+                          + "   R" + IntegerToString(i + 1) + " " + r, hdr);
+        }
+    }
+
+    if(InpShowTrendlines && row < DASH_MAX_LINES - 1) {
+        datetime nowT = iTime(_Symbol, _Period, 0);
+        string up = g_upperTL.valid ? DoubleToString(TLValueAt(g_upperTL, nowT), _Digits) : "-";
+        string lo = g_lowerTL.valid ? DoubleToString(TLValueAt(g_lowerTL, nowT), _Digits) : "-";
+        DashLine(row++, "TL upper " + up, ResolveResist());
+        DashLine(row++, "TL lower " + lo, ResolveSupport());
+    }
+
+    for(int i = row; i < DASH_MAX_LINES; i++) SafeDelete(OBJ_PREFIX + "dash_" + IntegerToString(i));
+}
+
+void DrawSmartSnRAll() {
+    DrawSnRLevels();
+    DrawTrendlinesOnChart();
+    DrawSnRDashboard();
+}
+
+//===================== MTF LEVELS ===================================
+bool IsHigherTF(ENUM_TIMEFRAMES tf) {
+    return PeriodSeconds(_Period) > PeriodSeconds(tf);
+}
+
+void DrawMTFLevels(ENUM_TIMEFRAMES tf, string tfTag, ENUM_SMC_LINESTYLE lineSt, color c) {
+    if(IsHigherTF(tf)) return;
+
+    double topLvl    = iHigh(_Symbol, tf, 1);
+    double bottomLvl = iLow (_Symbol, tf, 1);
+    if(topLvl == 0) return;
+
+    datetime leftT  = iTime(_Symbol, tf, 1);
+    datetime rightT = iTime(_Symbol, _Period, 0) + PeriodSeconds(_Period) * 20;
+
+    string topLine = OBJ_PREFIX + "mtfTL_" + tfTag;
+    string botLine = OBJ_PREFIX + "mtfBL_" + tfTag;
+    string topTxt  = OBJ_PREFIX + "mtfTT_" + tfTag;
+    string botTxt  = OBJ_PREFIX + "mtfBT_" + tfTag;
+
+    DrawTrend(topLine, leftT, topLvl,    rightT, topLvl,    c, LineStyle(lineSt), 1, false);
+    DrawTrend(botLine, leftT, bottomLvl, rightT, bottomLvl, c, LineStyle(lineSt), 1, false);
+    DrawText (topTxt,  rightT, topLvl,    "P" + tfTag + "H", c, 8, ANCHOR_LEFT);
+    DrawText (botTxt,  rightT, bottomLvl, "P" + tfTag + "L", c, 8, ANCHOR_LEFT);
+}
+
+//===================== TRAILING EXTREMES ============================
+void UpdateTrailingExtremes() {
+    double h = H(0), l = L(0);
+    if(h > g_trailing.top) {
+        g_trailing.top         = h;
+        g_trailing.lastTopTime = T(0);
+    }
+    if(l < g_trailing.bottom) {
+        g_trailing.bottom         = l;
+        g_trailing.lastBottomTime = T(0);
+    }
+}
+
+void DrawHighLowSwings() {
+    datetime rightT = iTime(_Symbol, _Period, 0) + PeriodSeconds(_Period) * 20;
+    string topL = OBJ_PREFIX + "hlTL";
+    string botL = OBJ_PREFIX + "hlBL";
+    string topT = OBJ_PREFIX + "hlTT";
+    string botT = OBJ_PREFIX + "hlBT";
+
+    color cTop = ResolveSwingBear();
+    color cBot = ResolveSwingBull();
+
+    DrawTrend(topL, g_trailing.lastTopTime,    g_trailing.top,    rightT, g_trailing.top,    cTop, STYLE_SOLID, 1, false);
+    DrawTrend(botL, g_trailing.lastBottomTime, g_trailing.bottom, rightT, g_trailing.bottom, cBot, STYLE_SOLID, 1, false);
+
+    string topTxt = (g_swingTrend.bias == BEARISH) ? "Strong High" : "Weak High";
+    string botTxt = (g_swingTrend.bias == BULLISH) ? "Strong Low"  : "Weak Low";
+    DrawText(topT, rightT, g_trailing.top,    topTxt, cTop, 7, ANCHOR_LEFT);
+    DrawText(botT, rightT, g_trailing.bottom, botTxt, cBot, 7, ANCHOR_LEFT);
+}
+
+//===================== PREMIUM / DISCOUNT ZONES =====================
+void DrawZone(string suffix, double topPx, double botPx, datetime leftT, datetime rightT,
+              string tag, color zoneColor, ENUM_ANCHOR_POINT anchor, double labelPrice) {
+    string boxName = OBJ_PREFIX + "pdZ_"   + suffix;
+    string txtName = OBJ_PREFIX + "pdTxt_" + suffix;
+    DrawRect(boxName, leftT, topPx, rightT, botPx, CLR_NONE, zoneColor, true);
+    datetime midT = (datetime)((long)leftT / 2 + (long)rightT / 2);
+    DrawText(txtName, midT, labelPrice, tag, zoneColor, 8, anchor);
+}
+
+void DrawPremiumDiscountZones() {
+    double top = g_trailing.top;
+    double bot = g_trailing.bottom;
+    if(top <= bot) return;
+
+    datetime nowT   = iTime(_Symbol, _Period, 0);
+    datetime leftT  = g_trailing.barTime > 0 ? g_trailing.barTime : nowT - PeriodSeconds(_Period) * 200;
+    datetime rightT = nowT + PeriodSeconds(_Period) * 5;
+
+    double premiumTop = top;
+    double premiumBot = 0.95 * top + 0.05 * bot;
+    double eqTop      = 0.525 * top + 0.475 * bot;
+    double eqBot      = 0.525 * bot + 0.475 * top;
+    double discTop    = 0.95 * bot + 0.05 * top;
+    double discBot    = bot;
+
+    color cPrem = ResolvePremium();
+    color cEq   = InpEquilibriumColor;
+    color cDisc = ResolveDiscount();
+
+    DrawZone("prm", premiumTop, premiumBot, leftT, rightT, "Premium",    cPrem, ANCHOR_UPPER, premiumTop);
+    DrawZone("eq",  eqTop,      eqBot,      leftT, rightT, "Equilibrium",cEq,   ANCHOR_CENTER, (eqTop + eqBot) / 2.0);
+    DrawZone("dsc", discTop,    discBot,    leftT, rightT, "Discount",   cDisc, ANCHOR_LOWER, discBot);
+}
+
+//===================== PER-BAR FLAG RESET ===========================
+void ResetAlerts() {
+    ZeroMemory(g_alerts);
+}
+
+//===================== HISTORICAL BACKFILL ==========================
+// Replay pivot detection, structure breaks, OB tracking, FVG detection,
+// trailing extremes AND (v1.12) the S/R + trendline engines over the most
+// recent N closed bars so all historical structures show up immediately.
+void BackfillHistory() {
+    int totalBars = Bars(_Symbol, _Period);
+
+    // v1.12: the S/R and TL pivot tests need 2×period bars of headroom on
+    // top of whatever the swing engine wants, so reserve for the largest.
+    int lookbackNeed = MathMax(InpSwingsLength,
+                               2 * MathMax(InpSnRPeriod, InpTLPeriod) + 5);
+    int scanBars = MathMin(InpBackfillBars, totalBars - lookbackNeed - 50);
+
+    if(scanBars < lookbackNeed * 2 + 50) {
+        PrintFormat("[SMC] Backfill skipped — not enough history (%d bars available)", totalBars);
+        return;
+    }
+
+    PrintFormat("[SMC] Backfilling %d historical bars...", scanBars);
+    uint t0 = GetTickCount();
+
+    for(int k = scanBars; k >= 1; k--) {
+        g_scanShift = k - 1;
+
+        ResetAlerts();            // suppress per-bar flags during scan
+        UpdateCumTR();
+
+        // Pivot capture (same calls as OnTick)
+        GetCurrentStructure(InpSwingsLength, false, false);   // swing
+        GetCurrentStructure(5,                false, true);    // internal
+        if(InpShowEQHEQL)
+            GetCurrentStructure(InpEQHEQLLength, true, false); // equal
+
+        if(InpShowFVG) {
+            DeleteFairValueGaps();
+            DrawFairValueGaps();
+        }
+
+        if(InpShowInternals || InpShowInternalOBs)
+            DisplayStructure(true);
+        if(InpShowStructure || InpShowSwingOBs || InpShowHighLowSwings)
+            DisplayStructure(false);
+
+        if(InpShowInternalOBs) DeleteOrderBlocks(true);
+        if(InpShowSwingOBs)    DeleteOrderBlocks(false);
+
+        if(InpShowHighLowSwings || InpShowPDZones)
+            UpdateTrailingExtremes();
+
+        // v1.12 — S/R + trendline state (draws zigzag + break arrows inline).
+        UpdateSmartSnR();
+    }
+
+    g_scanShift   = 0;
+    g_lastBarTime = iTime(_Symbol, _Period, 0);  // prevent OnTick reprocessing the latest bar
+    ResetAlerts();
+
+    PrintFormat("[SMC] Backfill done in %u ms — %d swing OBs, %d internal OBs, %d FVGs, %d R / %d S levels, TL up=%s lo=%s",
+                GetTickCount() - t0,
+                ArraySize(g_swingOBs), ArraySize(g_internalOBs), ArraySize(g_fvgs),
+                ArraySize(g_res), ArraySize(g_sup),
+                g_upperTL.valid ? "yes" : "no", g_lowerTL.valid ? "yes" : "no");
+}
+
+//====================================================================
+//  MULTI-TIMEFRAME SnR + TRENDLINE PUSH NOTIFIER
+//
+//  Included HERE (not at the top) because MQL5 requires declaration
+//  before use at global scope: the module reuses InpSnRPeriod,
+//  InpTLPeriod, InpTLSource and the ENUM_TL_SOURCE enum, all declared
+//  above this point. It is fully self-contained otherwise — it reads
+//  raw rates per timeframe, keeps its own state, and draws nothing.
+//====================================================================
+#include "SMC_SnR_TL_Notifier.mqh"
+
+//===================== ONINIT / ONDEINIT ============================
+int OnInit() {
+    g_atrHandle   = iATR(_Symbol, _Period, 200);
+    g_atr14Handle = iATR(_Symbol, _Period, 14);
+    if(g_atrHandle == INVALID_HANDLE || g_atr14Handle == INVALID_HANDLE) {
+        Print("[SMC] ATR handle creation failed");
+        return INIT_FAILED;
+    }
+
+    InitPivot(g_swingHigh);    InitPivot(g_swingLow);
+    InitPivot(g_internalHigh); InitPivot(g_internalLow);
+    InitPivot(g_equalHigh);    InitPivot(g_equalLow);
+    g_swingTrend.bias    = NEUTRAL;
+    g_internalTrend.bias = NEUTRAL;
+
+    g_trailing.top            = -DBL_MAX;
+    g_trailing.bottom         = DBL_MAX;
+    g_trailing.barTime        = 0;
+    g_trailing.lastTopTime    = 0;
+    g_trailing.lastBottomTime = 0;
+
+    g_swingLeg = 0; g_swingLegPrev = 0;
+    g_internalLeg = 0; g_internalLegPrev = 0;
+    g_equalLeg = 0; g_equalLegPrev = 0;
+
+    g_cumTR = 0.0; g_processedBars = 0;
+    g_lastBarTime = 0;
+    g_initialTime = 0;
+    g_scanShift = 0;
+    ResetAlerts();
+
+    ArrayResize(g_swingOBs, 0);
+    ArrayResize(g_internalOBs, 0);
+    ArrayResize(g_fvgs, 0);
+
+    //---- v1.12 state reset ----
+    ArrayResize(g_res, 0);
+    ArrayResize(g_sup, 0);
+    ArrayResize(g_zz,  0);
+    g_zzSegments  = 0;
+    g_lastRawType = 0;
+    g_lastRawTime = 0;
+
+    g_tlPhVal = 0.0; g_tlPhVal1 = 0.0; g_tlPhTime = 0; g_tlPhTime1 = 0;
+    g_tlPlVal = 0.0; g_tlPlVal1 = 0.0; g_tlPlTime = 0; g_tlPlTime1 = 0;
+
+    ZeroMemory(g_upperTL);
+    ZeroMemory(g_lowerTL);
+    g_prevUpVal = 0.0; g_prevLoVal = 0.0;
+    g_hadUpPrev = false; g_hadLoPrev = false;
+    g_tlBreakCounter = 0;
+
+    if(InpSnRPeriod < 1 || InpTLPeriod < 1) {
+        Print("[SMC] S/R and trendline periods must be >= 1");
+        return INIT_PARAMETERS_INCORRECT;
+    }
+
+    // ATR buffer needs a moment to populate after handle creation.
+    if(InpBackfillOnInit) {
+        int waitMs = 0;
+        double atrCheck[];
+        while(waitMs < 3000) {
+            if(CopyBuffer(g_atrHandle, 0, 1, 1, atrCheck) >= 1) break;
+            Sleep(50);
+            waitMs += 50;
+        }
+        BackfillHistory();
+
+        // Final draw passes: now that g_scanShift == 0, the right edges
+        // anchor to the live "now" instead of to historical scan positions.
+        if(InpShowInternalOBs)   DrawOrderBlocks(true);
+        if(InpShowSwingOBs)      DrawOrderBlocks(false);
+        if(InpShowHighLowSwings) DrawHighLowSwings();
+        if(InpShowPDZones)       DrawPremiumDiscountZones();
+        if(InpShowDaily)   DrawMTFLevels(PERIOD_D1, "D", InpDailyStyle,   InpDailyColor);
+        if(InpShowWeekly)  DrawMTFLevels(PERIOD_W1, "W", InpWeeklyStyle,  InpWeeklyColor);
+        if(InpShowMonthly) DrawMTFLevels(PERIOD_MN1,"M", InpMonthlyStyle, InpMonthlyColor);
+        DrawSmartSnRAll();   // v1.12
+        ChartRedraw();
+    }
+
+    EventSetTimer(15);
+    if(!STL_Init()) Print("[SMC] MTF SnR/TL notifier failed to initialise — continuing without it");
+    Print("[SMC] EA initialized on ", _Symbol, " ", EnumToString(_Period));
+    return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) {
+    EventKillTimer();
+    STL_Deinit();
+    if(g_atrHandle   != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+    if(g_atr14Handle != INVALID_HANDLE) IndicatorRelease(g_atr14Handle);
+    DeleteByPrefix(OBJ_PREFIX);
+    ChartRedraw();
+}
+
+//===================== ONTIMER ======================================
+void OnTimer() {
+    // Lightweight cleanup pass — re-run mitigation in case ticks were missed
+    if(InpShowInternalOBs) DeleteOrderBlocks(true);
+    if(InpShowSwingOBs)    DeleteOrderBlocks(false);
+    if(InpShowFVG)         DeleteFairValueGaps();
+
+    // v1.12 — keep the projected trendline price / dashboard live between bars.
+    if(InpShowTrendlines || InpShowDashboard) {
+        DrawTrendlinesOnChart();
+        DrawSnRDashboard();
+        ChartRedraw();
+    }
+
+    // v1.13 — higher timeframes print bars on their own schedule, not the
+    // chart's, so poll the notifier here too or an H4 level could go stale
+    // for hours. Each TF slot self-gates on its own new bar.
+    STL_Update();
+}
+
+//===================== ONTICK =======================================
+void OnTick() {
+    bool newBar = IsNewBar();
+    if(!newBar && !InpProcessOnTick) return;
+
+    // Warm-up guard — v1.12 also accounts for the S/R and TL pivot windows.
+    int warmup = MathMax(250, MathMax(InpSwingsLength + 50,
+                                      2 * MathMax(InpSnRPeriod, InpTLPeriod) + 10));
+    if(Bars(_Symbol, _Period) < warmup) return;
+
+    if(g_initialTime == 0) g_initialTime = T(0);
+
+    ResetAlerts();
+    UpdateCumTR();
+
+    // Pivot capture
+    GetCurrentStructure(InpSwingsLength, false, false);          // swing
+    GetCurrentStructure(5,                false, true);           // internal
+    if(InpShowEQHEQL)
+        GetCurrentStructure(InpEQHEQLLength, true, false);        // equal
+
+    // FVG (delete first, then draw fresh)
+    if(InpShowFVG) DeleteFairValueGaps();
+
+    // Structure breaks
+    if(InpShowInternals || InpShowInternalOBs)
+        DisplayStructure(true);
+    if(InpShowStructure || InpShowSwingOBs || InpShowHighLowSwings)
+        DisplayStructure(false);
+
+    // OB mitigation
+    if(InpShowInternalOBs) DeleteOrderBlocks(true);
+    if(InpShowSwingOBs)    DeleteOrderBlocks(false);
+
+    // Draw OBs (fresh each bar for last N)
+    if(InpShowInternalOBs) DrawOrderBlocks(true);
+    if(InpShowSwingOBs)    DrawOrderBlocks(false);
+
+    // FVG draw
+    if(InpShowFVG) DrawFairValueGaps();
+
+    // Trailing extremes + zones
+    if(InpShowHighLowSwings || InpShowPDZones) {
+        UpdateTrailingExtremes();
+        if(InpShowHighLowSwings) DrawHighLowSwings();
+        if(InpShowPDZones)       DrawPremiumDiscountZones();
+    }
+
+    // v1.12 — Smart S/R + trendlines (chart-TF state, then draw)
+    UpdateSmartSnR();
+    DrawSmartSnRAll();
+
+    // v1.13 — MTF SnR/TL push notifier (chart TF caught here; higher TFs
+    // are also polled from OnTimer).
+    STL_Update();
+
+    // MTF levels
+    if(InpShowDaily)   DrawMTFLevels(PERIOD_D1, "D", InpDailyStyle,   InpDailyColor);
+    if(InpShowWeekly)  DrawMTFLevels(PERIOD_W1, "W", InpWeeklyStyle,  InpWeeklyColor);
+    if(InpShowMonthly) DrawMTFLevels(PERIOD_MN1,"M", InpMonthlyStyle, InpMonthlyColor);
+
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
